@@ -65,22 +65,24 @@ static const char logger_syntax_reminder[] =
 static bool log_background = true;
 
 static void
-say_default(int level, const char *filename, int line, const char *error,
+say_default(int level, const char* module_name, const char *filename, int line, const char *error,
 	    const char *format, ...);
 
 static int
 say_format_boot(struct log *log, char *buf, int len, int level,
-		const char *filename, int line, const char *error,
+        const char* module_name, const char *filename,
+        int line, const char *error,
 		const char *format, va_list ap);
 static int
 say_format_syslog(struct log *log, char *buf, int len, int level,
-		  const char *filename, int line, const char *error,
+		  const char* module_name, const char *filename,
+		  int line, const char *error,
 		  const char *format, va_list ap);
 
 /** A utility function to handle va_list from different varargs functions. */
 static inline int
-log_vsay(struct log *log, int level, const char *filename, int line,
-	 const char *error, const char *format, va_list ap);
+log_vsay(struct log *log, int level, const char* module_name, const char *filename,
+     int line, const char *error, const char *format, va_list ap);
 
 /** Default logger used before logging subsystem is initialized. */
 static struct log log_boot = {
@@ -285,7 +287,7 @@ log_rotate(struct log *log)
 	/* We are in ev signal handler
 	 * so we don't have to be worry about async signal safety
 	 */
-	log_say(log, S_INFO, __FILE__, __LINE__, NULL,
+	log_say(log, S_INFO, "log", __FILE__, __LINE__, NULL,
 		"log file has been reopened");
 	/*
 	 * log_background applies only to log_default logger
@@ -638,6 +640,7 @@ log_create(struct log *log, const char *init_str, int nonblock)
 	log->path = NULL;
 	log->format_func = NULL;
 	log->level = S_INFO;
+	log->module_name = NULL;
 	log->rotating_threads = 0;
 	fiber_cond_create(&log->rotate_cond);
 	ev_async_init(&log->log_async, log_rotate_async_cb);
@@ -763,13 +766,15 @@ say_logger_free(void)
  * Used during boot time, e.g. without box.cfg().
  */
 static int
-say_format_boot(struct log *log, char *buf, int len, int level, const char *filename, int line,
-		const char *error, const char *format, va_list ap)
+say_format_boot(struct log *log, char *buf, int len, int level, const char* module_name,
+        const char *filename, int line, const char *error,
+        const char *format, va_list ap)
 {
 	(void) log;
 	(void) filename;
 	(void) line;
 	(void) level;
+	(void) module_name;
 	int total = 0;
 	SNPRINT(total, vsnprintf, buf, len, format, ap);
 	if (error != NULL)
@@ -824,8 +829,8 @@ say_format_plain_tail(char *buf, int len, int level, const char *filename,
  * YYYY-MM-DD hh:mm:ss.ms [PID]: CORD/FID/FIBERNAME LEVEL> MSG
  */
 int
-say_format_plain(struct log *log, char *buf, int len, int level, const char *filename, int line,
-		 const char *error, const char *format, va_list ap)
+say_format_plain(struct log *log, char *buf, int len, int level, const char* module_name,
+         const char *filename, int line, const char *error, const char *format, va_list ap)
 {
 	(void) log;
 	/* Don't use ev_now() since it requires a working event loop. */
@@ -843,6 +848,10 @@ say_format_plain(struct log *log, char *buf, int len, int level, const char *fil
 	/* Print pid */
 	SNPRINT(total, snprintf, buf, len, " [%i]", getpid());
 
+	/* Print module name */
+	if (module_name != NULL)
+	    SNPRINT(total, snprintf, buf, len, "<%s>", module_name);
+
 	/* Print remaining parts */
 	SNPRINT(total, say_format_plain_tail, buf, len, level, filename, line,
 		error, format, ap);
@@ -857,7 +866,8 @@ say_format_plain(struct log *log, char *buf, int len, int level, const char *fil
  * "fiber_name": <fiber_name>, filename": <filename>, "line": <fds>}
  */
 int
-say_format_json(struct log *log, char *buf, int len, int level, const char *filename, int line,
+say_format_json(struct log *log, char *buf, int len, int level,
+         const char* module_name, const char *filename, int line,
 		 const char *error, const char *format, va_list ap)
 {
 	(void) log;
@@ -880,6 +890,10 @@ say_format_json(struct log *log, char *buf, int len, int level, const char *file
 
 	SNPRINT(total, snprintf, buf, len, "\"level\": \"%s\", ",
 			level_to_string(level));
+
+	/* Print module name */
+	if (module_name != NULL)
+	    SNPRINT(total, snprintf, buf, len, "\"module_name\": \"%s\", ", module_name);
 
 	if (strncmp(format, "json", sizeof("json")) == 0) {
 		/*
@@ -952,7 +966,8 @@ say_format_json(struct log *log, char *buf, int len, int level, const char *file
  * - Identation is application name. By default it is "tarantool";
  */
 static int
-say_format_syslog(struct log *log, char *buf, int len, int level, const char *filename,
+say_format_syslog(struct log *log, char *buf, int len, int level,
+          const char* module_name, const char *filename,
 		  int line, const char *error, const char *format, va_list ap)
 {
 	/* Don't use ev_now() since it requires a working event loop. */
@@ -972,6 +987,10 @@ say_format_syslog(struct log *log, char *buf, int len, int level, const char *fi
 		LOG_MAKEPRI(8 * log->syslog_facility, prio));
 	SNPRINT(total, strftime, buf, len, "%h %e %T ", &tm);
 	SNPRINT(total, snprintf, buf, len, "%s[%d]:", log->syslog_ident, getpid());
+
+	/* Print module name */
+	if (module_name != NULL)
+	    SNPRINT(total, snprintf, buf, len, "<%s>", module_name);
 
 	/* Format message */
 	SNPRINT(total, say_format_plain_tail, buf, len, level, filename, line,
@@ -1009,13 +1028,13 @@ safe_write(int fd, const char *buf, int size)
 }
 
 static void
-say_default(int level, const char *filename, int line, const char *error,
+say_default(int level, const char* module_name, const char *filename, int line, const char *error,
 	    const char *format, ...)
 {
 	int errsv = errno;
 	va_list ap;
 	va_start(ap, format);
-	int total = log_vsay(log_default, level, filename,
+	int total = log_vsay(log_default, level, module_name, filename,
 			     line, error, format, ap);
 	if (level == S_FATAL && log_default->fd != STDERR_FILENO) {
 		ssize_t r = safe_write(STDERR_FILENO, buf, total);
@@ -1233,14 +1252,14 @@ log_destroy(struct log *log)
 }
 
 static inline int
-log_vsay(struct log *log, int level, const char *filename, int line,
-	 const char *error, const char *format, va_list ap)
+log_vsay(struct log *log, int level, const char* module_name, const char *filename,
+     int line, const char *error, const char *format, va_list ap)
 {
 	int errsv = errno;
 	if (level > log->level) {
 		return 0;
 	}
-	int total = log->format_func(log, buf, sizeof(buf), level,
+	int total = log->format_func(log, buf, sizeof(buf), level, module_name,
 				     filename, line, error, format, ap);
 	switch (log->type) {
 	case SAY_LOGGER_FILE:
@@ -1267,12 +1286,12 @@ log_vsay(struct log *log, int level, const char *filename, int line,
 }
 
 int
-log_say(struct log *log, int level, const char *filename, int line,
-	const char *error, const char *format, ...)
+log_say(struct log *log, int level, const char* module_name, const char *filename,
+    int line, const char *error, const char *format, ...)
 {
 	va_list ap;
 	va_start(ap, format);
-	int total = log_vsay(log, level, filename, line, error, format, ap);
+	int total = log_vsay(log, level, module_name, filename, line, error, format, ap);
 	va_end(ap);
 	return total;
 }
