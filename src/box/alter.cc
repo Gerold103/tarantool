@@ -3899,6 +3899,11 @@ on_replace_dd_schema(struct trigger * /* trigger */, void *event)
 		tt_uuid uu;
 		if (tuple_field_uuid(new_tuple, BOX_CLUSTER_FIELD_UUID, &uu) != 0)
 			return -1;
+		if (!tt_uuid_is_nil(&REPLICASET_UUID) &&
+		    !tt_uuid_is_equal(&REPLICASET_UUID, &uu)) {
+			diag_set(ClientError, ER_REPLICASET_UUID_IS_RO);
+			return -1;
+		}
 		REPLICASET_UUID = uu;
 		box_broadcast_id();
 		say_info("cluster uuid %s", tt_uuid_str(&uu));
