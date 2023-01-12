@@ -600,3 +600,8 @@ create_unit_test(PREFIX lua_tweaks
                            ${LIBYAML_LIBRARIES}
                            ${READLINE_LIBRARIES}
 )
+
+create_unit_test(PREFIX tt_node_name
+                 SOURCES tt_node_name.c core_test_utils.c
+                 LIBRARIES core unit
+)

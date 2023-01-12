@@ -40,6 +40,7 @@ set(core_sources
     prbuf.c
     clock_lowres.c
     ssl_init.c
+    tt_node_name.c
     tt_sigaction.c
     tt_strerror.c
     mp_util.c
