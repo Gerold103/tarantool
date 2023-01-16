@@ -56,6 +56,7 @@
 #include "lua/serializer.h" /* luaL_setmaphint */
 #include "fiber.h"
 #include "sio.h"
+#include "tt_node_name.h"
 #include "tt_strerror.h"
 #include "tweaks.h"
 
@@ -396,7 +397,12 @@ lbox_info_cluster(struct lua_State *L)
 {
 	if (!box_info_cluster_new_meaning)
 		return lbox_info_replicaset(L);
-	lua_createtable(L, 0, 0);
+	lua_createtable(L, 0, 1);
+	if (tt_node_name_is_nil(&CLUSTER_NAME))
+		luaL_pushnull(L);
+	else
+		lua_pushstring(L, tt_node_name_str(&CLUSTER_NAME));
+	lua_setfield(L, -2, "name");
 	return 1;
 }
 

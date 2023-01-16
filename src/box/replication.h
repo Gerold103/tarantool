@@ -37,6 +37,7 @@
 #include <small/rlist.h>
 #include "applier.h"
 #include "fiber_cond.h"
+#include "tt_node_name.h"
 #include "tt_uuid.h"
 #include "vclock/vclock.h"
 #include "latch.h"
@@ -233,6 +234,8 @@ extern uint32_t instance_id;
 extern struct tt_uuid INSTANCE_UUID;
 /** UUID of the replica set. */
 extern struct tt_uuid REPLICASET_UUID;
+/** Name of the entire cluster with all its replicasets. */
+extern struct tt_node_name CLUSTER_NAME;
 
 typedef rb_tree(struct replica) replica_hash_t;
 

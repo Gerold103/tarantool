@@ -58,6 +58,7 @@
 #include "space_upgrade.h"
 #include "box.h"
 #include "authentication.h"
+#include "tt_node_name.h"
 
 /* {{{ Auxiliary functions and methods. */
 
@@ -246,6 +247,43 @@ index_opts_decode(struct index_opts *opts, const char *map,
 		return -1;
 	}
 	return 0;
+}
+
+/** Decode an optional node name field from the tuple. */
+static int
+tuple_field_tt_node_name(struct tt_node_name *out, struct tuple *tuple,
+			 uint32_t fieldno, const char *field_name)
+{
+	uint32_t len = 0;
+	const char *field, *str = NULL;
+	if (tuple == NULL)
+		goto nil;
+	field = tuple_field(tuple, fieldno);
+	if (field == NULL || mp_typeof(*field) == MP_NIL)
+		goto nil;
+	if (mp_typeof(*field) == MP_STR)
+		str = mp_decode_str(&field, &len);
+	if (tt_node_name_set_str_n(out, str, len) != 0 ||
+	    tt_node_name_is_nil(out)) {
+		diag_set(ClientError, ER_FIELD_TYPE, field_name,
+			 "a valid name", "a bad name");
+		return -1;
+	}
+	return 0;
+nil:
+	tt_node_name_set_nil(out);
+	return 0;
+}
+
+/** Duplicate the node name on the region. */
+static struct tt_node_name *
+tt_node_name_dup(const struct tt_node_name *src, struct region *region)
+{
+	size_t size;
+	struct tt_node_name *dst = (typeof(dst))xregion_alloc_object(
+		region, typeof(*dst), &size);
+	tt_node_name_set(dst, src);
+	return dst;
 }
 
 /**
@@ -3891,6 +3929,19 @@ on_commit_dd_version(struct trigger *trigger, void * /* event */)
 	return 0;
 }
 
+/** Set cluster name on _schema commit. */
+static int
+on_commit_cluster_name(struct trigger *trigger, void * /* event */)
+{
+	const struct tt_node_name *name = (typeof(name))trigger->data;
+	if (tt_node_name_is_equal(&CLUSTER_NAME, name))
+		return 0;
+	tt_node_name_set(&CLUSTER_NAME, name);
+	box_broadcast_id();
+	say_info("cluster name: %s", tt_node_name_str(name));
+	return 0;
+}
+
 /**
  * This trigger is invoked only upon initial recovery, when
  * reading contents of the system spaces from the snapshot.
@@ -3979,6 +4030,30 @@ on_replace_dd_schema(struct trigger * /* trigger */, void *event)
 		}
 		struct trigger *on_commit = txn_alter_trigger_new(
 			on_commit_dd_version, (void *)(uintptr_t)version);
+		if (on_commit == NULL)
+			return -1;
+		txn_stmt_on_commit(stmt, on_commit);
+	} else if (strcmp(key, "cluster_name") == 0) {
+		struct tt_node_name name;
+		const char *field_name = "_schema['cluster_name'].value";
+		if (tuple_field_tt_node_name(&name, new_tuple,
+					     BOX_SCHEMA_FIELD_VALUE,
+					     field_name) != 0)
+			return -1;
+		if (box_is_configured() &&
+		    !tt_node_name_is_equal(&name, &CLUSTER_NAME)) {
+			if (!box_is_force_recovery) {
+				diag_set(ClientError, ER_UNSUPPORTED,
+					 "Tarantool", "cluster name change "
+					 "(without 'force_recovery')");
+				return -1;
+			}
+			say_info("cluster rename allowed by 'force_recovery'");
+		}
+		struct tt_node_name *name_copy = tt_node_name_dup(
+			&name, &txn->region);
+		struct trigger *on_commit = txn_alter_trigger_new(
+			on_commit_cluster_name, name_copy);
 		if (on_commit == NULL)
 			return -1;
 		txn_stmt_on_commit(stmt, on_commit);

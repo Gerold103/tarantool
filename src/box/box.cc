@@ -95,6 +95,7 @@
 #include "wal_ext.h"
 #include "mp_util.h"
 #include "small/static.h"
+#include "tt_node_name.h"
 
 static char status[64] = "unconfigured";
 
@@ -1322,6 +1323,24 @@ box_check_instance_uuid(struct tt_uuid *uuid)
 	return box_check_uuid(uuid, "instance_uuid", true);
 }
 
+/** Fetch an optional node name from the config. */
+static int
+box_check_tt_node_name(const char *cfg_name, struct tt_node_name *out)
+{
+	const char *name = cfg_gets(cfg_name);
+	if (name == NULL) {
+		tt_node_name_set_nil(out);
+		return 0;
+	}
+	/* Nil name is allowed as Lua box.NULL or nil. Not as "". */
+	if (tt_node_name_set_str(out, name) != 0 || tt_node_name_is_nil(out)) {
+		diag_set(ClientError, ER_CFG, cfg_name,
+			 "expected a valid name");
+		return -1;
+	}
+	return 0;
+}
+
 static int
 box_check_replicaset_uuid(struct tt_uuid *uuid)
 {
@@ -1359,6 +1378,12 @@ box_check_bootstrap_leader(struct uri *uri, struct tt_uuid *uuid)
 	diag_set(ClientError, ER_CFG, "bootstrap_leader",
 		 "the value must be either a uri or a uuid");
 	return -1;
+}
+
+static int
+box_check_cluster_name(struct tt_node_name *out)
+{
+	return box_check_tt_node_name("cluster_name", out);
 }
 
 static enum wal_mode
@@ -1975,6 +2000,40 @@ box_set_replication_anon(void)
 			  " has finished");
 	}
 	guard.is_active = false;
+}
+
+/**
+ * Set the cluster name record in _schema, bypassing all checks like whether the
+ * instance is writable. It makes the function usable by bootstrap master when
+ * it is read-only but has to make the first registration.
+ */
+static void
+box_set_cluster_name_record(const struct tt_node_name *name)
+{
+	int rc;
+	if (tt_node_name_is_nil(name)) {
+		rc = boxk(IPROTO_DELETE, BOX_SCHEMA_ID, "[%s]", "cluster_name");
+	} else {
+		rc = boxk(IPROTO_REPLACE, BOX_SCHEMA_ID, "[%s%s]",
+			  "cluster_name", tt_node_name_str(name));
+	}
+	if (rc != 0)
+		diag_raise();
+}
+
+void
+box_set_cluster_name(void)
+{
+	struct tt_node_name name;
+	if (box_check_cluster_name(&name) != 0)
+		diag_raise();
+	/* Nil means the config doesn't care, allows to use any name. */
+	if (tt_node_name_is_nil(&name))
+		return;
+	if (tt_node_name_is_equal(&CLUSTER_NAME, &name))
+		return;
+	box_check_writable_xc();
+	box_set_cluster_name_record(&name);
 }
 
 /** Trigger to catch ACKs from all nodes when need to wait for quorum. */
@@ -4166,17 +4225,23 @@ box_process_vote(struct ballot *ballot)
 	ballot->registered_replica_uuids_size = i;
 }
 
+/** Fill _schema space with initial data on bootstrap. */
 static void
-box_set_replicaset_uuid(void)
+box_populate_schema_space(void)
 {
 	struct tt_uuid replicaset_uuid;
 	if (box_check_replicaset_uuid(&replicaset_uuid) != 0)
 		diag_raise();
+	struct tt_node_name cluster_name;
+	if (box_check_cluster_name(&cluster_name) != 0)
+		diag_raise();
+
 	if (tt_uuid_is_nil(&replicaset_uuid))
 		tt_uuid_create(&replicaset_uuid);
 	if (boxk(IPROTO_INSERT, BOX_SCHEMA_ID, "[%s%s]", "replicaset_uuid",
 		 tt_uuid_str(&replicaset_uuid)))
 		diag_raise();
+	box_set_cluster_name_record(&cluster_name);
 }
 
 static void
@@ -4276,10 +4341,19 @@ check_bootstrap_unanimity(void)
 static int
 check_global_ids_integrity(void)
 {
+	struct tt_node_name cluster_name;
 	struct tt_uuid replicaset_uuid;
-	if (box_check_replicaset_uuid(&replicaset_uuid) != 0)
+	if (box_check_cluster_name(&cluster_name) != 0 ||
+	    box_check_replicaset_uuid(&replicaset_uuid) != 0)
 		return -1;
 
+	if (!tt_node_name_is_nil(&cluster_name) &&
+	    !tt_node_name_is_equal(&cluster_name, &CLUSTER_NAME)) {
+		diag_set(ClientError, ER_CLUSTER_NAME_MISMATCH,
+			 tt_node_name_str(&cluster_name),
+			 tt_node_name_str(&CLUSTER_NAME));
+		return -1;
+	}
 	if (!tt_uuid_is_nil(&replicaset_uuid) &&
 	    !tt_uuid_is_equal(&replicaset_uuid, &REPLICASET_UUID)) {
 		diag_set(ClientError, ER_REPLICASET_UUID_MISMATCH,
@@ -4311,9 +4385,7 @@ bootstrap_master(void)
 	uint32_t replica_id = 1;
 	box_insert_replica_record(replica_id, &INSTANCE_UUID);
 	assert(replica_by_uuid(&INSTANCE_UUID)->id == 1);
-
-	/* Set UUID of a new replica set */
-	box_set_replicaset_uuid();
+	box_populate_schema_space();
 
 	/* Enable WAL subsystem. */
 	if (wal_enable() != 0)
@@ -5044,13 +5116,18 @@ box_broadcast_id(void)
 {
 	char buf[1024];
 	char *w = buf;
-	w = mp_encode_map(w, 3);
+	w = mp_encode_map(w, 4);
 	w = mp_encode_str0(w, "id");
 	w = mp_encode_uint(w, instance_id);
 	w = mp_encode_str0(w, "instance_uuid");
 	w = mp_encode_uuid(w, &INSTANCE_UUID);
 	w = mp_encode_str0(w, "replicaset_uuid");
 	w = mp_encode_uuid(w, &REPLICASET_UUID);
+	w = mp_encode_str0(w, "cluster_name");
+	if (tt_node_name_is_nil(&CLUSTER_NAME))
+		w = mp_encode_nil(w);
+	else
+		w = mp_encode_str0(w, tt_node_name_str(&CLUSTER_NAME));
 
 	box_broadcast("box.id", strlen("box.id"), buf, w);
 
