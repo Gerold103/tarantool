@@ -1381,6 +1381,12 @@ box_check_bootstrap_leader(struct uri *uri, struct tt_uuid *uuid)
 }
 
 static int
+box_check_replicaset_name(struct tt_node_name *out)
+{
+	return box_check_tt_node_name("replicaset_name", out);
+}
+
+static int
 box_check_cluster_name(struct tt_node_name *out)
 {
 	return box_check_tt_node_name("cluster_name", out);
@@ -2034,6 +2040,41 @@ box_set_cluster_name(void)
 		return;
 	box_check_writable_xc();
 	box_set_cluster_name_record(&name);
+}
+
+/**
+ * Set the new replicaset name record in _schema, bypassing all checks like
+ * whether the instance is writable. It makes the function usable by bootstrap
+ * master when it is read-only but has to make the first registration.
+ */
+static void
+box_set_replicaset_name_record(const struct tt_node_name *name)
+{
+	int rc;
+	if (tt_node_name_is_nil(name)) {
+		rc = boxk(IPROTO_DELETE, BOX_SCHEMA_ID, "[%s]",
+			  "replicaset_name");
+	} else {
+		rc = boxk(IPROTO_REPLACE, BOX_SCHEMA_ID, "[%s%s]",
+			  "replicaset_name", tt_node_name_str(name));
+	}
+	if (rc != 0)
+		diag_raise();
+}
+
+void
+box_set_replicaset_name(void)
+{
+	struct tt_node_name name;
+	if (box_check_replicaset_name(&name) != 0)
+		diag_raise();
+	/* Nil means the config doesn't care, allows to use any name. */
+	if (tt_node_name_is_nil(&name))
+		return;
+	if (tt_node_name_is_equal(&REPLICASET_NAME, &name))
+		return;
+	box_check_writable_xc();
+	box_set_replicaset_name_record(&name);
 }
 
 /** Trigger to catch ACKs from all nodes when need to wait for quorum. */
@@ -4069,7 +4110,17 @@ box_process_subscribe(struct iostream *io, const struct xrow_header *header)
 			  tt_uuid_str(&REPLICASET_UUID),
 			  tt_uuid_str(&req.replicaset_uuid));
 	}
-
+	/*
+	 * Replicaset name mismatch is not considered a critical error. It can
+	 * happen if rename happened and then some replicas reconnected. They
+	 * won't ever be able to fetch the new name if the master rejects them.
+	 */
+	if (!tt_node_name_is_equal(&req.replicaset_name, &REPLICASET_NAME)) {
+		say_warn("Replicaset name mismatch on subscribe. Peer name - %s, "
+			 "local name - %s",
+			 tt_node_name_str(&req.replicaset_name),
+			 tt_node_name_str(&REPLICASET_NAME));
+	}
 	/*
 	 * Do not allow non-anonymous followers for anonymous
 	 * instances.
@@ -4136,6 +4187,7 @@ box_process_subscribe(struct iostream *io, const struct xrow_header *header)
 	memset(&rsp, 0, sizeof(rsp));
 	vclock_copy(&rsp.vclock, &replicaset.vclock);
 	rsp.replicaset_uuid = REPLICASET_UUID;
+	tt_node_name_set(&rsp.replicaset_name, &REPLICASET_NAME);
 	struct xrow_header row;
 	RegionGuard region_guard(&fiber()->gc);
 	xrow_encode_subscribe_response(&row, &rsp);
@@ -4232,6 +4284,9 @@ box_populate_schema_space(void)
 	struct tt_uuid replicaset_uuid;
 	if (box_check_replicaset_uuid(&replicaset_uuid) != 0)
 		diag_raise();
+	struct tt_node_name replicaset_name;
+	if (box_check_replicaset_name(&replicaset_name) != 0)
+		diag_raise();
 	struct tt_node_name cluster_name;
 	if (box_check_cluster_name(&cluster_name) != 0)
 		diag_raise();
@@ -4242,6 +4297,7 @@ box_populate_schema_space(void)
 		 tt_uuid_str(&replicaset_uuid)))
 		diag_raise();
 	box_set_cluster_name_record(&cluster_name);
+	box_set_replicaset_name_record(&replicaset_name);
 }
 
 static void
@@ -4342,8 +4398,10 @@ static int
 check_global_ids_integrity(void)
 {
 	struct tt_node_name cluster_name;
+	struct tt_node_name replicaset_name;
 	struct tt_uuid replicaset_uuid;
 	if (box_check_cluster_name(&cluster_name) != 0 ||
+	    box_check_replicaset_name(&replicaset_name) != 0 ||
 	    box_check_replicaset_uuid(&replicaset_uuid) != 0)
 		return -1;
 
@@ -4352,6 +4410,13 @@ check_global_ids_integrity(void)
 		diag_set(ClientError, ER_CLUSTER_NAME_MISMATCH,
 			 tt_node_name_str(&cluster_name),
 			 tt_node_name_str(&CLUSTER_NAME));
+		return -1;
+	}
+	if (!tt_node_name_is_nil(&replicaset_name) &&
+	    !tt_node_name_is_equal(&replicaset_name, &REPLICASET_NAME)) {
+		diag_set(ClientError, ER_REPLICASET_NAME_MISMATCH,
+			 tt_node_name_str(&replicaset_name),
+			 tt_node_name_str(&REPLICASET_NAME));
 		return -1;
 	}
 	if (!tt_uuid_is_nil(&replicaset_uuid) &&
@@ -5116,13 +5181,18 @@ box_broadcast_id(void)
 {
 	char buf[1024];
 	char *w = buf;
-	w = mp_encode_map(w, 4);
+	w = mp_encode_map(w, 5);
 	w = mp_encode_str0(w, "id");
 	w = mp_encode_uint(w, instance_id);
 	w = mp_encode_str0(w, "instance_uuid");
 	w = mp_encode_uuid(w, &INSTANCE_UUID);
 	w = mp_encode_str0(w, "replicaset_uuid");
 	w = mp_encode_uuid(w, &REPLICASET_UUID);
+	w = mp_encode_str0(w, "replicaset_name");
+	if (tt_node_name_is_nil(&REPLICASET_NAME))
+		w = mp_encode_nil(w);
+	else
+		w = mp_encode_str0(w, tt_node_name_str(&REPLICASET_NAME));
 	w = mp_encode_str0(w, "cluster_name");
 	if (tt_node_name_is_nil(&CLUSTER_NAME))
 		w = mp_encode_nil(w);
