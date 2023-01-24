@@ -180,6 +180,7 @@ enum iproto_key {
 	 */
 	IPROTO_AUTH_TYPE = 0x5b,
 	IPROTO_REPLICASET_NAME = 0x5c,
+	IPROTO_INSTANCE_NAME = 0x5d,
 	/*
 	 * Be careful to not extend iproto_key values over 0x7f.
 	 * iproto_keys are encoded in msgpack as positive fixnum, which ends at

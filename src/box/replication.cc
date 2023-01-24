@@ -45,6 +45,8 @@
 
 uint32_t instance_id = REPLICA_ID_NIL;
 struct tt_uuid INSTANCE_UUID;
+struct tt_node_name INSTANCE_NAME;
+
 struct tt_uuid REPLICASET_UUID;
 struct tt_node_name REPLICASET_NAME;
 struct tt_node_name CLUSTER_NAME;
@@ -62,6 +64,7 @@ int replication_threads = 1;
 bool cfg_replication_anon = true;
 struct tt_uuid cfg_bootstrap_leader_uuid;
 struct uri cfg_bootstrap_leader_uri;
+struct tt_node_name cfg_instance_name;
 
 struct replicaset replicaset;
 
@@ -282,6 +285,7 @@ replica_new(void)
 	replica->id = 0;
 	replica->anon = false;
 	replica->uuid = uuid_nil;
+	tt_node_name_set_nil(&replica->name);
 	replica->applier = NULL;
 	replica->gc = NULL;
 	replica->is_applier_healthy = false;
@@ -365,6 +369,27 @@ replica_set_id(struct replica *replica, uint32_t replica_id)
 	replica->anon = false;
 	box_update_replication_synchro_quorum();
 	box_broadcast_ballot();
+}
+
+void
+replica_set_name(struct replica *replica, const struct tt_node_name *name)
+{
+	if (tt_node_name_is_equal(&replica->name, name))
+		return;
+	assert(replica_by_name(name) == NULL);
+	tt_node_name_set(&replica->name, name);
+	if (tt_uuid_is_equal(&INSTANCE_UUID, &replica->uuid)) {
+		tt_node_name_set(&INSTANCE_NAME, name);
+		box_broadcast_id();
+	}
+	if (!tt_node_name_is_nil(name)) {
+		say_info("assigned name %s to replica %s",
+			 tt_node_name_str(name),
+			 tt_uuid_str(&replica->uuid));
+	} else {
+		say_info("removed name from replica %s",
+			 tt_uuid_str(&replica->uuid));
+	}
 }
 
 void
@@ -1368,6 +1393,18 @@ replica_by_uuid(const struct tt_uuid *uuid)
 	struct replica key;
 	key.uuid = *uuid;
 	return replica_hash_search(&replicaset.hash, &key);
+}
+
+struct replica *
+replica_by_name(const struct tt_node_name *name)
+{
+	if (tt_node_name_is_nil(name))
+		return NULL;
+	replicaset_foreach(replica) {
+		if (tt_node_name_is_equal(&replica->name, name))
+			return replica;
+	}
+	return NULL;
 }
 
 struct replica *
