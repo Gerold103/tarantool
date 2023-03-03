@@ -394,7 +394,7 @@ g_config_success.test_correct_bootstrap_leader = function(cg)
     cg.replica_set:start{}
     t.helpers.retrying({}, cg.server1.exec, cg.server1, function(uuid)
         local t = require('luatest')
-        t.assert_equals(box.info.cluster.uuid, uuid,
+        t.assert_equals(box.info.replicaset.uuid, uuid,
                         'Server bootstrapped from correct leader')
     end, {uuidb})
 end
@@ -432,7 +432,7 @@ g_config_success.test_wait_only_for_leader = function(cg)
     cg.replica_set:start{}
     t.helpers.retrying({}, cg.server1.exec, cg.server1, function(uuid)
         local t = require('luatest')
-        t.assert_equals(box.info.cluster.uuid, uuid,
+        t.assert_equals(box.info.replicaset.uuid, uuid,
                         'Server boots as soon as sees the leader')
     end, {uuidb})
 end
