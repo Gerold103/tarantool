@@ -48,6 +48,28 @@ txn_limbo_write_synchro(struct txn_limbo *limbo, uint16_t type, int64_t lsn,
 static void
 txn_limbo_read_confirm(struct txn_limbo *limbo, int64_t lsn);
 
+static inline struct txn_limbo_entry *
+txn_limbo_first_entry(struct txn_limbo *limbo)
+{
+	return rlist_first_entry(&limbo->queue, struct txn_limbo_entry,
+				 in_queue);
+}
+
+static inline struct txn_limbo_entry *
+txn_limbo_last_entry(struct txn_limbo *limbo)
+{
+	return rlist_last_entry(&limbo->queue, struct txn_limbo_entry,
+				in_queue);
+}
+
+double
+txn_limbo_age(struct txn_limbo *limbo)
+{
+	if (txn_limbo_is_empty(limbo))
+		return 0;
+	return fiber_clock() - txn_limbo_first_entry(limbo)->insertion_time;
+}
+
 /**
  * Write a confirmation entry to the WAL. After it's written all the
  * transactions waiting for confirmation may be finished.
@@ -177,7 +199,32 @@ txn_limbo_is_ro(struct txn_limbo *limbo)
 		txn_limbo_is_frozen(limbo));
 }
 
-void
+/** Decrease queue size once write request is complete. */
+static inline void
+txn_limbo_on_remove(struct txn_limbo *limbo,
+		    const struct txn_limbo_entry *entry)
+{
+	bool limbo_was_full = txn_limbo_is_full(limbo);
+	limbo->size -= entry->approx_len;
+	assert(limbo->size >= 0);
+	limbo->len--;
+	assert(limbo->len >= 0);
+	/* Wake up all fibers waiting to add a new limbo entry. */
+	if (limbo_was_full && !txn_limbo_is_full(limbo))
+		fiber_cond_broadcast(&limbo->wait_cond);
+}
+
+/** Pop the first entry. */
+static inline void
+txn_limbo_pop_first(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
+{
+	assert(!rlist_empty(&entry->in_queue));
+	assert(txn_limbo_first_entry(limbo) == entry);
+	rlist_del_entry(entry, in_queue);
+	txn_limbo_on_remove(limbo, entry);
+}
+
+static void
 txn_limbo_complete(struct txn *txn, bool is_success)
 {
 	/*
@@ -211,6 +258,40 @@ txn_limbo_complete(struct txn *txn, bool is_success)
 	fiber_set_session(fiber(), orig_session);
 }
 
+/** Complete the given limbo entry with a failure and the given reason. */
+static void
+txn_limbo_complete_fail(struct txn_limbo *limbo, struct txn_limbo_entry *entry,
+			int64_t signature)
+{
+	assert(entry->state == TXN_LIMBO_ENTRY_SUBMITTED);
+	struct txn *txn = entry->txn;
+	txn->signature = signature;
+	txn->limbo_entry = NULL;
+	txn_limbo_abort(limbo, entry);
+	txn_clear_flags(txn, TXN_WAIT_SYNC | TXN_WAIT_ACK);
+	txn_limbo_complete(txn, false);
+}
+
+/** Complete the given limbo entry with a success. */
+static void
+txn_limbo_complete_success(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
+{
+	assert(entry->state == TXN_LIMBO_ENTRY_SUBMITTED);
+	struct txn *txn = entry->txn;
+	entry->state = TXN_LIMBO_ENTRY_COMMIT;
+	if (txn_has_flag(txn, TXN_WAIT_ACK))
+		limbo->confirm_lag = fiber_clock() - entry->insertion_time;
+	txn->limbo_entry = NULL;
+	txn_limbo_pop_first(limbo, entry);
+	txn_clear_flags(txn, TXN_WAIT_SYNC | TXN_WAIT_ACK);
+	/*
+	 * Should be written to WAL by now. Confirm is always written after the
+	 * affected transactions.
+	 */
+	assert(txn->signature >= 0);
+	txn_limbo_complete(txn, true);
+}
+
 struct txn_limbo_entry *
 txn_limbo_last_synchro_entry(struct txn_limbo *limbo)
 {
@@ -229,21 +310,6 @@ txn_limbo_on_append(struct txn_limbo *limbo,
 {
 	limbo->size += entry->approx_len;
 	limbo->len++;
-}
-
-/** Decrease queue size once write request is complete. */
-static inline void
-txn_limbo_on_remove(struct txn_limbo *limbo,
-		    const struct txn_limbo_entry *entry)
-{
-	bool limbo_was_full = txn_limbo_is_full(limbo);
-	limbo->size -= entry->approx_len;
-	assert(limbo->size >= 0);
-	limbo->len--;
-	assert(limbo->len >= 0);
-	/* Wake up all fibers waiting to add a new limbo entry. */
-	if (limbo_was_full && !txn_limbo_is_full(limbo))
-		fiber_cond_broadcast(&limbo->wait_cond);
 }
 
 struct txn_limbo_entry *
@@ -301,48 +367,31 @@ txn_limbo_append(struct txn_limbo *limbo, uint32_t id, struct txn *txn,
 	e->txn = txn;
 	e->approx_len = approx_len;
 	e->lsn = -1;
-	e->is_commit = false;
-	e->is_rollback = false;
+	e->state = TXN_LIMBO_ENTRY_SUBMITTED;
 	e->insertion_time = fiber_clock();
 	rlist_add_tail_entry(&limbo->queue, e, in_queue);
 	txn_limbo_on_append(limbo, e);
 	return e;
 }
 
-static inline void
-txn_limbo_remove(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
-{
-	assert(!rlist_empty(&entry->in_queue));
-	assert(txn_limbo_first_entry(limbo) == entry);
-	rlist_del_entry(entry, in_queue);
-	txn_limbo_on_remove(limbo, entry);
-}
-
-static inline void
-txn_limbo_pop(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
-{
-	assert(!rlist_empty(&entry->in_queue));
-	assert(txn_limbo_last_entry(limbo) == entry);
-	assert(entry->is_rollback);
-
-	rlist_del_entry(entry, in_queue);
-	txn_limbo_on_remove(limbo, entry);
-	++limbo->rollback_count;
-}
-
 void
 txn_limbo_abort(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 {
-	entry->is_rollback = true;
-	if (entry == limbo->entry_to_confirm)
-		limbo->entry_to_confirm = NULL;
+	assert(entry->state == TXN_LIMBO_ENTRY_SUBMITTED);
+	assert(!rlist_empty(&entry->in_queue));
 	/*
 	 * The simple rule about rollback/commit order applies
 	 * here as well: commit always in the order of WAL write,
 	 * rollback in the reversed order. Rolled back transaction
 	 * is always the last.
 	 */
-	txn_limbo_pop(limbo, entry);
+	assert(txn_limbo_last_entry(limbo) == entry);
+	entry->state = TXN_LIMBO_ENTRY_ROLLBACK;
+	if (entry == limbo->entry_to_confirm)
+		limbo->entry_to_confirm = NULL;
+	rlist_del_entry(entry, in_queue);
+	txn_limbo_on_remove(limbo, entry);
+	++limbo->rollback_count;
 }
 
 void
@@ -468,11 +517,7 @@ txn_limbo_wait_complete(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 	struct txn_limbo_entry *tmp;
 	rlist_foreach_entry_safe_reverse(e, &limbo->queue,
 					 in_queue, tmp) {
-		e->txn->signature = TXN_SIGNATURE_QUORUM_TIMEOUT;
-		e->txn->limbo_entry = NULL;
-		txn_limbo_abort(limbo, e);
-		txn_clear_flags(e->txn, TXN_WAIT_SYNC | TXN_WAIT_ACK);
-		txn_limbo_complete(e->txn, false);
+		txn_limbo_complete_fail(limbo, e, TXN_SIGNATURE_QUORUM_TIMEOUT);
 		if (e == entry)
 			break;
 	}
@@ -496,7 +541,7 @@ complete:
 	 * The first tx to be rolled back already performed all
 	 * the necessary cleanups for us.
 	 */
-	if (entry->is_rollback) {
+	if (entry->state == TXN_LIMBO_ENTRY_ROLLBACK) {
 		diag_set(ClientError, ER_SYNC_ROLLBACK);
 		return -1;
 	}
@@ -624,7 +669,7 @@ txn_limbo_read_confirm(struct txn_limbo *limbo, int64_t lsn)
 			 * created in the applier.
 			 */
 			txn_clear_flags(e->txn, TXN_WAIT_SYNC);
-			txn_limbo_remove(limbo, e);
+			txn_limbo_pop_first(limbo, e);
 			/*
 			 * The limbo entry now should not be used by the owner
 			 * transaction since it just became a plain one. Nullify
@@ -635,18 +680,7 @@ txn_limbo_read_confirm(struct txn_limbo *limbo, int64_t lsn)
 			e->txn = NULL;
 			continue;
 		}
-		e->is_commit = true;
-		if (txn_has_flag(e->txn, TXN_WAIT_ACK))
-			limbo->confirm_lag = fiber_clock() - e->insertion_time;
-		e->txn->limbo_entry = NULL;
-		txn_limbo_remove(limbo, e);
-		txn_clear_flags(e->txn, TXN_WAIT_SYNC | TXN_WAIT_ACK);
-		/*
-		 * Should be written to WAL by now. Confirm is always written
-		 * after the affected transactions.
-		 */
-		assert(e->txn->signature >= 0);
-		txn_limbo_complete(e->txn, true);
+		txn_limbo_complete_success(limbo, e);
 	}
 	/*
 	 * Track CONFIRM lsn on replica in order to detect split-brain by
@@ -702,16 +736,12 @@ txn_limbo_read_rollback(struct txn_limbo *limbo, int64_t lsn)
 	if (last_rollback == NULL)
 		return;
 	rlist_foreach_entry_safe_reverse(e, &limbo->queue, in_queue, tmp) {
-		txn_limbo_abort(limbo, e);
-		txn_clear_flags(e->txn, TXN_WAIT_ACK);
 		/*
 		 * Should be written to WAL by now. Rollback is always written
 		 * after the affected transactions.
 		 */
 		assert(e->txn->signature >= 0);
-		e->txn->signature = TXN_SIGNATURE_SYNC_ROLLBACK;
-		e->txn->limbo_entry = NULL;
-		txn_limbo_complete(e->txn, false);
+		txn_limbo_complete_fail(limbo, e, TXN_SIGNATURE_SYNC_ROLLBACK);
 		if (e == last_rollback)
 			break;
 	}

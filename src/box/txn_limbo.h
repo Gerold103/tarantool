@@ -44,6 +44,15 @@ extern "C" {
 struct txn;
 struct synchro_request;
 
+enum txn_limbo_entry_state {
+	/** Is saved and accounted in the limbo. */
+	TXN_LIMBO_ENTRY_SUBMITTED,
+	/** Committed, not in the limbo anymore. */
+	TXN_LIMBO_ENTRY_COMMIT,
+	/** Rolled back, not in the limbo anymore. */
+	TXN_LIMBO_ENTRY_ROLLBACK,
+};
+
 /**
  * Transaction and its quorum metadata, to be stored in limbo.
  */
@@ -62,13 +71,8 @@ struct txn_limbo_entry {
 	 * written to WAL yet.
 	 */
 	int64_t lsn;
-	/**
-	 * Result flags. Only one of them can be true. But both
-	 * can be false if the transaction is still waiting for
-	 * its resolution.
-	 */
-	bool is_commit;
-	bool is_rollback;
+	/** State of this entry. */
+	enum txn_limbo_entry_state state;
 	/** When this entry was added to the queue. */
 	double insertion_time;
 };
@@ -76,7 +80,7 @@ struct txn_limbo_entry {
 static inline bool
 txn_limbo_entry_is_complete(const struct txn_limbo_entry *e)
 {
-	return e->is_commit || e->is_rollback;
+	return e->state > TXN_LIMBO_ENTRY_SUBMITTED;
 }
 
 /**
@@ -278,6 +282,10 @@ struct txn_limbo {
  */
 extern struct txn_limbo txn_limbo;
 
+/** Get the age of the oldest non-confirmed limbo entry. */
+double
+txn_limbo_age(struct txn_limbo *limbo);
+
 static inline bool
 txn_limbo_is_empty(struct txn_limbo *limbo)
 {
@@ -292,20 +300,6 @@ txn_limbo_is_full(struct txn_limbo *limbo)
 
 bool
 txn_limbo_is_ro(struct txn_limbo *limbo);
-
-static inline struct txn_limbo_entry *
-txn_limbo_first_entry(struct txn_limbo *limbo)
-{
-	return rlist_first_entry(&limbo->queue, struct txn_limbo_entry,
-				 in_queue);
-}
-
-static inline struct txn_limbo_entry *
-txn_limbo_last_entry(struct txn_limbo *limbo)
-{
-	return rlist_last_entry(&limbo->queue, struct txn_limbo_entry,
-				in_queue);
-}
 
 /**
  * Return the latest term as seen in PROMOTE requests from instance with id
