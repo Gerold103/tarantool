@@ -828,10 +828,7 @@ txn_limbo_read_confirm(struct txn_limbo *limbo, int64_t lsn)
 {
 	assert(limbo->owner_id != REPLICA_ID_NIL || txn_limbo_is_empty(limbo));
 	assert(limbo == &txn_limbo);
-	if (limbo->confirmed_lsn < lsn) {
-		limbo->confirmed_lsn = lsn;
-		vclock_follow(&limbo->confirmed_vclock, limbo->owner_id, lsn);
-	}
+	assert(limbo->confirmed_lsn <= lsn);
 	struct txn_limbo_entry *e, *next;
 	rlist_foreach_entry_safe(e, &limbo->queue, in_queue, next) {
 		/*
@@ -850,6 +847,22 @@ txn_limbo_read_confirm(struct txn_limbo *limbo, int64_t lsn)
 			 */
 			if (e->lsn == -1)
 				break;
+			if (!rlist_empty(&e->txn->on_commit)) {
+				/*
+				 * Bump the confirmed LSN right now, do not
+				 * batch with any newer txns. So on-commit
+				 * triggers would see the confirmation LSN
+				 * matching this txn exactly. Making an illusion
+				 * like each txn has its own confirmation.
+				 */
+				if (limbo->confirmed_lsn < e->lsn) {
+					limbo->confirmed_lsn = e->lsn;
+					vclock_follow(&limbo->confirmed_vclock,
+						      limbo->owner_id, e->lsn);
+				} else {
+					assert(limbo->confirmed_lsn == lsn);
+				}
+			}
 		} else if (e->txn->signature == TXN_SIGNATURE_UNKNOWN) {
 			/*
 			 * A transaction might be covered by the CONFIRM even if
@@ -892,6 +905,10 @@ txn_limbo_read_confirm(struct txn_limbo *limbo, int64_t lsn)
 			continue;
 		}
 		txn_limbo_complete_success(limbo, e);
+	}
+	if (limbo->confirmed_lsn < lsn) {
+		limbo->confirmed_lsn = lsn;
+		vclock_follow(&limbo->confirmed_vclock, limbo->owner_id, lsn);
 	}
 }
 
@@ -1334,90 +1351,6 @@ txn_limbo_filter_generic(struct txn_limbo *limbo,
 }
 
 /**
- * A common filter for all synchro requests, checking that request operates
- * over a valid lsn range.
- */
-static int
-txn_limbo_filter_queue_boundaries(struct txn_limbo *limbo,
-				  const struct synchro_request *req)
-{
-	int64_t lsn = req->lsn;
-	/*
-	 * Easy case - processed LSN matches the new one which comes inside
-	 * request, everything is consistent. This is allowed only for
-	 * PROMOTE/DEMOTE.
-	 */
-	if (limbo->confirmed_lsn == lsn) {
-		if (iproto_type_is_promote_request(req->type)) {
-			return 0;
-		} else {
-			say_error("%s. Duplicate request with confirmed lsn "
-				  "%lld = request lsn %lld", reject_str(req),
-				  (long long)limbo->confirmed_lsn,
-				  (long long)lsn);
-			diag_set(ClientError, ER_UNSUPPORTED, "Replication",
-				 "Duplicate CONFIRM/ROLLBACK request");
-			return -1;
-		}
-	}
-
-	/*
-	 * Explicit split brain situation. Request comes in with an old LSN
-	 * which we've already processed.
-	 */
-	if (limbo->confirmed_lsn > lsn) {
-		say_error("%s. confirmed lsn %lld > request lsn %lld",
-			  reject_str(req), (long long)limbo->confirmed_lsn,
-			  (long long)lsn);
-		diag_set(ClientError, ER_SPLIT_BRAIN,
-			 "got a request with lsn from an already "
-			 "processed range");
-		return -1;
-	}
-
-	/*
-	 * The last case requires a few subcases.
-	 */
-	assert(limbo->confirmed_lsn < lsn);
-
-	if (txn_limbo_is_empty(limbo)) {
-		/*
-		 * Transactions are rolled back already,
-		 * since the limbo is empty.
-		 */
-		say_error("%s. confirmed lsn %lld < request lsn %lld "
-			  "and empty limbo", reject_str(req),
-			  (long long)limbo->confirmed_lsn,
-			  (long long)lsn);
-		diag_set(ClientError, ER_SPLIT_BRAIN,
-			 "got a request mentioning future lsn");
-		return -1;
-	} else {
-		/*
-		 * Some entries are present in the limbo, we need to make sure
-		 * that request lsn lays inside limbo [first; last] range.
-		 * So that the request has some queued data to process,
-		 * otherwise it means the request comes from split brained node.
-		 */
-		int64_t first_lsn = txn_limbo_first_entry(limbo)->lsn;
-		int64_t last_lsn = txn_limbo_last_synchro_entry(limbo)->lsn;
-
-		if (lsn < first_lsn || last_lsn < lsn) {
-			say_error("%s. request lsn %lld out of range "
-				  "[%lld; %lld]", reject_str(req),
-				  (long long)lsn,
-				  (long long)first_lsn,
-				  (long long)last_lsn);
-			diag_set(ClientError, ER_SPLIT_BRAIN,
-				 "got a request lsn out of queue range");
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-/**
  * Filter CONFIRM and ROLLBACK packets.
  */
 static int
@@ -1426,6 +1359,7 @@ txn_limbo_filter_confirm_rollback(struct txn_limbo *limbo,
 {
 	assert(latch_is_locked(&limbo->promote_latch));
 	assert(limbo->do_validate);
+	(void)limbo;
 	assert(req->type == IPROTO_RAFT_CONFIRM ||
 	       req->type == IPROTO_RAFT_ROLLBACK);
 	/*
@@ -1437,8 +1371,7 @@ txn_limbo_filter_confirm_rollback(struct txn_limbo *limbo,
 			 "zero LSN for CONFIRM/ROLLBACK");
 		return -1;
 	}
-
-	return txn_limbo_filter_queue_boundaries(limbo, req);
+	return 0;
 }
 
 /** A filter PROMOTE and DEMOTE packets. */
@@ -1473,8 +1406,61 @@ txn_limbo_filter_promote_demote(struct txn_limbo *limbo,
 			 "got a PROMOTE/DEMOTE with an obsolete term");
 		return -1;
 	}
-
-	return txn_limbo_filter_queue_boundaries(limbo, req);
+	/*
+	 * Explicit split brain situation. Request comes in with an old LSN
+	 * which we've already processed.
+	 */
+	if (limbo->confirmed_lsn > req->lsn) {
+		say_error("%s. confirmed lsn %lld > request lsn %lld",
+			  reject_str(req), (long long)limbo->confirmed_lsn,
+			  (long long)req->lsn);
+		diag_set(ClientError, ER_SPLIT_BRAIN,
+			 "got a request with lsn from an already "
+			 "processed range");
+		return -1;
+	}
+	/*
+	 * Easy case - processed LSN matches the new one which comes inside
+	 * request, everything is consistent. This is allowed only for
+	 * PROMOTE/DEMOTE.
+	 */
+	if (limbo->confirmed_lsn == req->lsn)
+		return 0;
+	/*
+	 * The last case requires a few subcases.
+	 */
+	if (txn_limbo_is_empty(limbo)) {
+		/*
+		 * Transactions are rolled back already,
+		 * since the limbo is empty.
+		 */
+		say_error("%s. confirmed lsn %lld < request lsn %lld "
+			  "and empty limbo", reject_str(req),
+			  (long long)limbo->confirmed_lsn,
+			  (long long)req->lsn);
+		diag_set(ClientError, ER_SPLIT_BRAIN,
+			 "got a request mentioning future lsn");
+		return -1;
+	}
+	/*
+	 * Some entries are present in the limbo, we need to make sure that
+	 * request lsn lays inside limbo [first; last] range. So that the
+	 * request has some queued data to process, otherwise it means the
+	 * request comes from split brained node.
+	 */
+	int64_t first_lsn = txn_limbo_first_entry(limbo)->lsn;
+	int64_t last_lsn = txn_limbo_last_synchro_entry(limbo)->lsn;
+	if (req->lsn < first_lsn || last_lsn < req->lsn) {
+		say_error("%s. request lsn %lld out of range "
+			  "[%lld; %lld]", reject_str(req),
+			  (long long)req->lsn,
+			  (long long)first_lsn,
+			  (long long)last_lsn);
+		diag_set(ClientError, ER_SPLIT_BRAIN,
+			 "got a request lsn out of queue range");
+		return -1;
+	}
+	return 0;
 }
 
 /** A fine-grained filter checking specific request type constraints. */
